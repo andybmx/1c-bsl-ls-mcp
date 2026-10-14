@@ -1,6 +1,6 @@
 //! Pure helpers for P1 analysis tools (call graph, impact, quality, complexity).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{json, Value};
 
@@ -111,10 +111,11 @@ pub fn call_item_from_edge(edge: &Value, direction: &str) -> Option<Value> {
 /// Call graph in both directions.
 /// `expand(item, "up"|"down")` returns call-hierarchy edges.
 ///
-/// Each direction is an iterative DFS that expands a node once.
-/// An edge to a node still on the active path is a back-edge (`is_cycle`)
-/// and is not followed. An edge to a node already finished on another path
-/// is dropped, so a diamond contributes that node once and is not a cycle.
+/// Each direction is a BFS that expands a node once. Every discovered edge is
+/// kept. A repeat is a reference to the node already expanded (`is_repeated`),
+/// not a second visit. Tarjan's strongly connected components then mark that
+/// reference as a back-edge (`is_cycle`) only when both ends lie in the same
+/// cyclic component. A diamond keeps the second edge and is not a cycle.
 pub async fn build_call_graph_json<F, Fut>(
     root_item: Value,
     limits: CallGraphLimits,
@@ -192,29 +193,116 @@ where
     })
 }
 
-const COLOR_ON_PATH: u8 = 1;
-const COLOR_FINISHED: u8 = 2;
-
-struct WalkFrame {
-    item: Value,
-    depth: u32,
-    key: String,
-    edges: Vec<Value>,
-    next_edge: usize,
-    child_refs: Vec<Value>,
-    entered: bool,
-}
-
-fn back_edge_stub(child: &Value, child_key: String) -> Value {
+fn repeat_stub(child: &Value, child_key: &str) -> Value {
     json!({
         "name": child.get("name").cloned().unwrap_or(json!("")),
         "uri": child.get("uri").cloned().unwrap_or(Value::Null),
         "key": child_key,
-        "is_cycle": true,
+        "target_id": child_key,
+        "is_repeated": true,
         "module_type": classify_module_type(
             child.get("uri").and_then(|v| v.as_str()).unwrap_or("")
         ),
     })
+}
+
+/// Cyclic SCCs of a directed call graph.
+/// A component is cyclic when it has two or more nodes, or a self-loop.
+/// Group ids start at 1. Nodes outside a cycle are absent.
+fn cyclic_groups(edges: &[(String, String)]) -> HashMap<String, u32> {
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut self_loops: HashSet<&str> = HashSet::new();
+    let mut order: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (from, to) in edges {
+        if seen.insert(from.as_str()) {
+            order.push(from.as_str());
+        }
+        if seen.insert(to.as_str()) {
+            order.push(to.as_str());
+        }
+        if from == to {
+            self_loops.insert(from.as_str());
+        }
+        adj.entry(from.as_str()).or_default().push(to.as_str());
+    }
+
+    struct Tarjan<'a> {
+        adj: HashMap<&'a str, Vec<&'a str>>,
+        self_loops: HashSet<&'a str>,
+        index_counter: u32,
+        indices: HashMap<&'a str, u32>,
+        low: HashMap<&'a str, u32>,
+        stack: Vec<&'a str>,
+        on_stack: HashSet<&'a str>,
+        groups: HashMap<String, u32>,
+        next_group: u32,
+    }
+
+    impl<'a> Tarjan<'a> {
+        fn strongconnect(&mut self, node: &'a str) {
+            let index = self.index_counter;
+            self.index_counter += 1;
+            self.indices.insert(node, index);
+            self.low.insert(node, index);
+            self.stack.push(node);
+            self.on_stack.insert(node);
+
+            let neighbors = self.adj.get(node).cloned().unwrap_or_default();
+            for next in neighbors {
+                if !self.indices.contains_key(next) {
+                    self.strongconnect(next);
+                    let low_next = self.low[next];
+                    let low_node = self.low[node];
+                    self.low.insert(node, low_node.min(low_next));
+                } else if self.on_stack.contains(next) {
+                    let index_next = self.indices[next];
+                    let low_node = self.low[node];
+                    self.low.insert(node, low_node.min(index_next));
+                }
+            }
+
+            if self.low[node] != self.indices[node] {
+                return;
+            }
+            let mut component = Vec::new();
+            while let Some(member) = self.stack.pop() {
+                self.on_stack.remove(member);
+                component.push(member);
+                if member == node {
+                    break;
+                }
+            }
+            let cyclic =
+                component.len() > 1 || (component.len() == 1 && self.self_loops.contains(node));
+            if !cyclic {
+                return;
+            }
+            let group = self.next_group;
+            self.next_group += 1;
+            for member in component {
+                self.groups.insert(member.to_string(), group);
+            }
+        }
+    }
+
+    let mut tarjan = Tarjan {
+        adj,
+        self_loops,
+        index_counter: 0,
+        indices: HashMap::new(),
+        low: HashMap::new(),
+        stack: Vec::new(),
+        on_stack: HashSet::new(),
+        groups: HashMap::new(),
+        next_group: 1,
+    };
+    for node in order {
+        if !tarjan.indices.contains_key(node) {
+            tarjan.strongconnect(node);
+        }
+    }
+    tarjan.groups
 }
 
 async fn build_tree<F, Fut>(
@@ -236,128 +324,116 @@ where
     let root_key = item_key(root);
     let mut nodes: HashMap<String, Value> = HashMap::new();
     let mut children_map: HashMap<String, Vec<Value>> = HashMap::new();
-    // Gray (on the active path) vs black (expanded). A gray target is a
-    // back-edge. A black target was already visited and is dropped.
-    let mut color: HashMap<String, u8> = HashMap::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut call_edges: Vec<(String, String)> = Vec::new();
+    let mut queue: VecDeque<(Value, u32, String)> = VecDeque::new();
 
-    let mut stack = Vec::new();
     if max_nodes == 0 {
         *truncated = true;
         *truncate_reason = format!("max_nodes={max_nodes}");
     } else {
-        stack.push(WalkFrame {
-            item: root.clone(),
-            depth: 0,
-            key: root_key.clone(),
-            edges: Vec::new(),
-            next_edge: 0,
-            child_refs: Vec::new(),
-            entered: false,
-        });
+        visited.insert(root_key.clone());
+        queue.push_back((root.clone(), 0, root_key.clone()));
     }
 
-    while let Some(mut frame) = stack.pop() {
-        if !frame.entered {
-            if *node_count >= max_nodes {
-                *truncated = true;
-                *truncate_reason = format!("max_nodes={max_nodes}");
-                continue;
-            }
-            *node_count += 1;
-            color.insert(frame.key.clone(), COLOR_ON_PATH);
+    while let Some((item, depth, key)) = queue.pop_front() {
+        if *node_count >= max_nodes {
+            *truncated = true;
+            *truncate_reason = format!("max_nodes={max_nodes}");
+            break;
+        }
+        *node_count += 1;
 
-            let name = frame
-                .item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let uri = frame.item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-            let is_entry = is_bsl_entry_point(&name);
-            if is_entry {
-                entry_points.push(name.clone());
-            }
-            nodes.insert(
-                frame.key.clone(),
-                json!({
-                    "name": name,
-                    "uri": frame.item.get("uri").cloned().unwrap_or(Value::Null),
-                    "key": frame.key.clone(),
-                    "depth": frame.depth,
-                    "direction": direction,
-                    "module_type": classify_module_type(uri),
-                    "is_entry_point": is_entry,
-                }),
-            );
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let uri = item.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+        let is_entry = is_bsl_entry_point(&name);
+        if is_entry {
+            entry_points.push(name.clone());
+        }
+        nodes.insert(
+            key.clone(),
+            json!({
+                "name": name,
+                "uri": item.get("uri").cloned().unwrap_or(Value::Null),
+                "key": key.clone(),
+                "depth": depth,
+                "direction": direction,
+                "module_type": classify_module_type(uri),
+                "is_entry_point": is_entry,
+            }),
+        );
 
-            if frame.depth >= max_depth {
-                children_map.insert(frame.key.clone(), Vec::new());
-                color.insert(frame.key, COLOR_FINISHED);
-                continue;
-            }
+        if depth >= max_depth {
+            children_map.entry(key).or_default();
+            continue;
+        }
 
-            match expand(frame.item.clone(), direction).await {
-                Ok(edges) => {
-                    frame.edges = edges;
-                    frame.entered = true;
-                    stack.push(frame);
-                }
-                Err(err) => {
-                    if let Some(node) = nodes.get_mut(&frame.key) {
-                        if let Some(obj) = node.as_object_mut() {
-                            obj.insert("error".into(), json!(err));
-                        }
+        let edges = match expand(item.clone(), direction).await {
+            Ok(value) => value,
+            Err(err) => {
+                if let Some(node) = nodes.get_mut(&key) {
+                    if let Some(obj) = node.as_object_mut() {
+                        obj.insert("error".into(), json!(err));
                     }
-                    children_map.insert(frame.key.clone(), Vec::new());
-                    color.insert(frame.key, COLOR_FINISHED);
                 }
+                children_map.entry(key).or_default();
+                continue;
             }
-            continue;
-        }
-
-        if frame.next_edge >= frame.edges.len() {
-            children_map.insert(frame.key.clone(), frame.child_refs);
-            color.insert(frame.key, COLOR_FINISHED);
-            continue;
-        }
-
-        let edge = frame.edges[frame.next_edge].clone();
-        frame.next_edge += 1;
-        let Some(child_item) = call_item_from_edge(&edge, direction) else {
-            stack.push(frame);
-            continue;
         };
-        let child_key = item_key(&child_item);
-        match color.get(&child_key).copied() {
-            Some(COLOR_ON_PATH) => {
-                *cycles += 1;
-                frame
-                    .child_refs
-                    .push(back_edge_stub(&child_item, child_key));
-                stack.push(frame);
+
+        let mut child_refs = Vec::new();
+        for edge in edges {
+            let Some(child_item) = call_item_from_edge(&edge, direction) else {
+                continue;
+            };
+            let child_key = item_key(&child_item);
+            call_edges.push((key.clone(), child_key.clone()));
+            if visited.contains(&child_key) {
+                // Already queued or expanded. Keep the edge, do not walk it again.
+                child_refs.push(repeat_stub(&child_item, &child_key));
+                continue;
             }
-            Some(COLOR_FINISHED) => {
-                stack.push(frame);
+            visited.insert(child_key.clone());
+            child_refs.push(json!({ "ref": child_key.clone() }));
+            queue.push_back((child_item, depth + 1, child_key));
+        }
+        children_map.insert(key, child_refs);
+    }
+
+    let groups = cyclic_groups(&call_edges);
+    *cycles += groups.values().collect::<HashSet<_>>().len();
+    for (key, node) in nodes.iter_mut() {
+        if let Some(group) = groups.get(key) {
+            if let Some(obj) = node.as_object_mut() {
+                obj.insert("cycle_group".into(), json!(group));
             }
-            _ => {
-                if *node_count >= max_nodes {
-                    *truncated = true;
-                    *truncate_reason = format!("max_nodes={max_nodes}");
-                    stack.push(frame);
-                    continue;
+        }
+    }
+    for (parent_key, refs) in children_map.iter_mut() {
+        for child in refs.iter_mut() {
+            if child.get("is_repeated").and_then(|v| v.as_bool()) != Some(true) {
+                continue;
+            }
+            let Some(child_key) = child
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let cyclic_edge = matches!(
+                (groups.get(parent_key), groups.get(&child_key)),
+                (Some(left), Some(right)) if left == right
+            );
+            if let Some(obj) = child.as_object_mut() {
+                obj.insert("is_cycle".into(), json!(cyclic_edge));
+                if let Some(group) = groups.get(&child_key).filter(|_| cyclic_edge) {
+                    obj.insert("cycle_group".into(), json!(group));
                 }
-                let child_depth = frame.depth + 1;
-                frame.child_refs.push(json!({ "ref": child_key.clone() }));
-                stack.push(frame);
-                stack.push(WalkFrame {
-                    item: child_item,
-                    depth: child_depth,
-                    key: child_key,
-                    edges: Vec::new(),
-                    next_edge: 0,
-                    child_refs: Vec::new(),
-                    entered: false,
-                });
             }
         }
     }
@@ -370,10 +446,12 @@ where
         let mut node = nodes.get(key).cloned().unwrap_or(json!({ "key": key }));
         let mut kids = Vec::new();
         if let Some(refs) = children_map.get(key) {
-            for r in refs {
-                if r.get("is_cycle").and_then(|v| v.as_bool()) == Some(true) {
-                    kids.push(r.clone());
-                } else if let Some(child_key) = r.get("ref").and_then(|v| v.as_str()) {
+            for child in refs {
+                let repeated = child.get("is_repeated").and_then(|v| v.as_bool()) == Some(true);
+                let cycle = child.get("is_cycle").and_then(|v| v.as_bool()) == Some(true);
+                if repeated || cycle {
+                    kids.push(child.clone());
+                } else if let Some(child_key) = child.get("ref").and_then(|v| v.as_str()) {
                     kids.push(materialize(child_key, nodes, children_map));
                 }
             }
@@ -623,7 +701,9 @@ mod tests {
     fn real_names(node: &Value) -> Vec<String> {
         let mut names = Vec::new();
         fn walk(node: &Value, names: &mut Vec<String>) {
-            if node.get("is_cycle").and_then(|v| v.as_bool()) == Some(true) {
+            let cycle = node.get("is_cycle").and_then(|v| v.as_bool()) == Some(true);
+            let repeated = node.get("is_repeated").and_then(|v| v.as_bool()) == Some(true);
+            if cycle || repeated {
                 return;
             }
             if let Some(name) = node.get("name").and_then(|v| v.as_str()) {
@@ -763,9 +843,14 @@ mod tests {
         assert_eq!(graph["total_nodes"], 3);
         assert_eq!(expands.load(Ordering::SeqCst), 2);
         assert_eq!(real_names(&graph["outgoing_tree"]), vec!["A", "B"]);
+        let group = graph["outgoing_tree"]["cycle_group"].as_u64().unwrap();
+        assert_eq!(graph["outgoing_tree"]["children"][0]["cycle_group"], group);
         let back = &graph["outgoing_tree"]["children"][0]["children"][0];
         assert_eq!(back["is_cycle"], true);
+        assert_eq!(back["is_repeated"], true);
         assert_eq!(back["key"], item_key(&root));
+        assert_eq!(back["target_id"], item_key(&root));
+        assert_eq!(back["cycle_group"], group);
         assert!(back.get("children").is_none());
 
         let first = present_call_graph(&graph, PageQuery::parse(None, Some(1), None).unwrap());
@@ -852,24 +937,42 @@ mod tests {
             json!([])
         );
         assert_eq!(outgoing["children"][1]["name"], "C");
-        assert_eq!(outgoing["children"][1]["children"], json!([]));
+        let repeated = &outgoing["children"][1]["children"][0];
+        assert_eq!(repeated["is_repeated"], true);
+        assert_eq!(repeated["is_cycle"], false);
+        assert_eq!(repeated["target_id"], item_key(&d));
+        assert!(repeated.get("children").is_none());
+        assert!(outgoing.get("cycle_group").is_none());
 
         let summary = present_call_graph(&graph, PageQuery::parse(None, None, None).unwrap());
-        assert_eq!(summary["total"], 3);
-        assert_eq!(summary["returned"], 3);
+        assert_eq!(summary["total"], 4);
+        assert_eq!(summary["returned"], 4);
         assert!(summary["next_offset"].is_null());
         let listed: Vec<_> = summary["items"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|item| item["name"].as_str().unwrap())
+            .map(|item| {
+                (
+                    item["name"].as_str().unwrap(),
+                    item["is_repeated"].as_bool().unwrap_or(false),
+                    item["is_cycle"].as_bool().unwrap_or(false),
+                )
+            })
             .collect();
-        assert_eq!(listed, vec!["B", "D", "C"]);
-        assert!(summary["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| item["is_cycle"] == false));
+        assert_eq!(
+            listed,
+            vec![
+                ("B", false, false),
+                ("D", false, false),
+                ("C", false, false),
+                ("D", true, false),
+            ]
+        );
+        let page = present_call_graph(&graph, PageQuery::parse(Some(3), Some(1), None).unwrap());
+        assert_eq!(page["returned"], 1);
+        assert_eq!(page["items"][0]["is_repeated"], true);
+        assert!(page["next_offset"].is_null());
     }
 
     #[tokio::test]
@@ -918,14 +1021,121 @@ mod tests {
         let mut names = real_names(&graph["outgoing_tree"]);
         names.sort();
         assert_eq!(names, vec!["A", "B", "C"]);
+        assert!(graph["outgoing_tree"].get("cycle_group").is_none());
         let b_node = &graph["outgoing_tree"]["children"][0];
+        let c_node = &graph["outgoing_tree"]["children"][1];
         assert_eq!(b_node["name"], "B");
-        assert_eq!(b_node["children"][0]["name"], "C");
-        assert_eq!(b_node["children"][0]["children"][0]["is_cycle"], true);
-        assert_eq!(b_node["children"][0]["children"][0]["key"], item_key(&b));
-        assert_eq!(
-            graph["outgoing_tree"]["children"].as_array().unwrap().len(),
-            1
-        );
+        assert_eq!(c_node["name"], "C");
+        let group = b_node["cycle_group"].as_u64().unwrap();
+        assert_eq!(c_node["cycle_group"], group);
+        assert_eq!(b_node["children"][0]["is_cycle"], true);
+        assert_eq!(b_node["children"][0]["is_repeated"], true);
+        assert_eq!(b_node["children"][0]["target_id"], item_key(&c));
+        assert_eq!(c_node["children"][0]["is_cycle"], true);
+        assert_eq!(c_node["children"][0]["target_id"], item_key(&b));
+    }
+
+    #[tokio::test]
+    async fn call_graph_self_loop_is_a_cycle_without_a_second_visit() {
+        let root = symbol("A");
+        let expands = Arc::new(AtomicUsize::new(0));
+        let graph = build_call_graph_json(
+            root.clone(),
+            CallGraphLimits {
+                depth_up: 0,
+                depth_down: 10,
+                max_nodes: 50,
+            },
+            {
+                let root = root.clone();
+                let expands = Arc::clone(&expands);
+                move |item, direction| {
+                    let root = root.clone();
+                    let expands = Arc::clone(&expands);
+                    async move {
+                        if direction != "down" {
+                            return Ok(vec![]);
+                        }
+                        expands.fetch_add(1, Ordering::SeqCst);
+                        if item_key(&item) == item_key(&root) {
+                            Ok(vec![json!({"to": root})])
+                        } else {
+                            Ok(vec![])
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(graph["cycles_found"], 1);
+        assert_eq!(graph["total_nodes"], 2);
+        assert_eq!(expands.load(Ordering::SeqCst), 1);
+        assert_eq!(real_names(&graph["outgoing_tree"]), vec!["A"]);
+        let back = &graph["outgoing_tree"]["children"][0];
+        assert_eq!(back["is_cycle"], true);
+        assert_eq!(back["is_repeated"], true);
+        assert_eq!(back["target_id"], item_key(&root));
+        assert!(graph["outgoing_tree"]["cycle_group"].is_number());
+    }
+
+    #[tokio::test]
+    async fn call_graph_mutual_recursion_is_one_component() {
+        let root = symbol("A");
+        let b = symbol("B");
+        let c = symbol("C");
+        let graph = build_call_graph_json(
+            root.clone(),
+            CallGraphLimits {
+                depth_up: 0,
+                depth_down: 10,
+                max_nodes: 50,
+            },
+            {
+                let root = root.clone();
+                let b = b.clone();
+                let c = c.clone();
+                move |item, direction| {
+                    let root = root.clone();
+                    let b = b.clone();
+                    let c = c.clone();
+                    async move {
+                        if direction != "down" {
+                            return Ok(vec![]);
+                        }
+                        let key = item_key(&item);
+                        if key == item_key(&root) {
+                            Ok(vec![json!({"to": b})])
+                        } else if key == item_key(&b) {
+                            Ok(vec![json!({"to": c})])
+                        } else if key == item_key(&c) {
+                            Ok(vec![json!({"to": root})])
+                        } else {
+                            Ok(vec![])
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(graph["cycles_found"], 1);
+        assert_eq!(graph["truncated"], false);
+        assert_eq!(graph["total_nodes"], 4);
+        let mut names = real_names(&graph["outgoing_tree"]);
+        names.sort();
+        assert_eq!(names, vec!["A", "B", "C"]);
+        let group = graph["outgoing_tree"]["cycle_group"].as_u64().unwrap();
+        let b_node = &graph["outgoing_tree"]["children"][0];
+        let c_node = &b_node["children"][0];
+        assert_eq!(b_node["name"], "B");
+        assert_eq!(c_node["name"], "C");
+        assert_eq!(b_node["cycle_group"], group);
+        assert_eq!(c_node["cycle_group"], group);
+        let back = &c_node["children"][0];
+        assert_eq!(back["is_cycle"], true);
+        assert_eq!(back["is_repeated"], true);
+        assert_eq!(back["target_id"], item_key(&root));
+        assert_eq!(back["cycle_group"], group);
     }
 }

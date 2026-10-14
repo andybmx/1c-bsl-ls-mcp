@@ -183,18 +183,32 @@ fn flatten_tree(node: &Value, direction: &str, out: &mut Vec<Value>) {
         return;
     };
     for child in children {
-        if child.get("is_cycle").and_then(Value::as_bool) == Some(true) {
-            out.push(json!({
+        let is_cycle = child.get("is_cycle").and_then(Value::as_bool) == Some(true);
+        let is_repeated = child.get("is_repeated").and_then(Value::as_bool) == Some(true);
+        if is_cycle || is_repeated {
+            let mut row = json!({
                 "name": child.get("name").cloned().unwrap_or(Value::Null),
                 "uri": child.get("uri").cloned().unwrap_or(Value::Null),
                 "key": child.get("key").cloned().unwrap_or(Value::Null),
                 "direction": direction,
                 "module_type": child.get("module_type").cloned().unwrap_or(Value::Null),
-                "is_cycle": true
-            }));
+                "is_cycle": is_cycle,
+                "is_repeated": is_repeated
+            });
+            if let Some(target) = child.get("target_id") {
+                row.as_object_mut()
+                    .expect("row")
+                    .insert("target_id".into(), target.clone());
+            }
+            if let Some(group) = child.get("cycle_group") {
+                row.as_object_mut()
+                    .expect("row")
+                    .insert("cycle_group".into(), group.clone());
+            }
+            out.push(row);
             continue;
         }
-        out.push(json!({
+        let mut row = json!({
             "name": child.get("name").cloned().unwrap_or(Value::Null),
             "uri": child.get("uri").cloned().unwrap_or(Value::Null),
             "key": child.get("key").cloned().unwrap_or(Value::Null),
@@ -203,7 +217,13 @@ fn flatten_tree(node: &Value, direction: &str, out: &mut Vec<Value>) {
             "module_type": child.get("module_type").cloned().unwrap_or(Value::Null),
             "is_entry_point": child.get("is_entry_point").cloned().unwrap_or(json!(false)),
             "is_cycle": false
-        }));
+        });
+        if let Some(group) = child.get("cycle_group") {
+            row.as_object_mut()
+                .expect("row")
+                .insert("cycle_group".into(), group.clone());
+        }
+        out.push(row);
         flatten_tree(child, direction, out);
     }
 }
